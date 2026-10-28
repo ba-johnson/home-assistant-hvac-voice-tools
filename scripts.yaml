@@ -1,0 +1,155 @@
+hvac_available_modes:
+  alias: HVAC available modes
+  description: 'Read-only: list climate units with exact entity IDs, names, areas, current HVAC modes
+    and supported HVAC modes. Use before setting HVAC mode to identify the correct unit and supported
+    mode. Does not change any device. HVAC mode is separate from fan speed, presets and swing.'
+  mode: parallel
+  max: 10
+  fields:
+    entity_id:
+      name: Climate entity
+      description: Optional exact climate entity ID. Omit to list all climate units.
+      selector:
+        text: {}
+  sequence:
+  - variables:
+      requested_target: '{{ entity_id | default('''') | string | lower | trim }}'
+      matching_entities: |-
+        {% set ns = namespace(ids=[]) %}
+        {% for s in states.climate %}
+        {% if requested_target in [s.entity_id | lower, s.name | lower, s.object_id | replace('_', ' ') | lower] %}
+        {% set ns.ids = ns.ids + [s.entity_id] %}
+        {% endif %}{% endfor %}{{ ns.ids }}
+  - if:
+    - condition: template
+      value_template: '{{ requested_target and matching_entities | length != 1 }}'
+    then:
+    - variables:
+        failure_result:
+          success: false
+          error: Climate name is unknown or ambiguous. Ask for the exact unit name; do not guess. No device
+            was changed.
+    - stop: Climate name is unknown or ambiguous. Ask for the exact unit name; do not guess. No device
+        was changed.
+      response_variable: failure_result
+  - variables:
+      mode_list: |-
+        {% set ns = namespace(units=[]) %}
+        {% for s in states.climate %}
+        {% if not requested_target or s.entity_id in matching_entities %}
+        {% set ns.units = ns.units + [dict(entity_id=s.entity_id, name=s.name, area=area_name(s.entity_id), hvac_mode=s.state, available=s.state not in ['unknown','unavailable'], supported_modes=s.attributes.get('hvac_modes', []))] %}
+        {% endif %}{% endfor %}
+        {{ dict(units=ns.units, note='Only supported_modes are valid. heat_cool means automatic heating/cooling; auto is a separate mode and is only valid if listed.') }}
+  - stop: Available HVAC modes
+    response_variable: mode_list
+hvac_set_mode_verified:
+  alias: HVAC set mode verified
+  description: Set HVAC operating mode on any climate unit and verify the reported result before success.
+    Use hvac_available_modes first for exact entity ID and supported modes. For requests for heat, cool,
+    dry/dehumidify, fan only, automatic heating/cooling or off, use this tool, never HassClimateSetTemperature.
+    heat_cool is automatic heating/cooling; auto is a distinct schedule/AI mode. Only use a mode supported
+    by that unit. Leaves target temperature unchanged. Errors on invalid targets, unsupported modes or
+    unconfirmed changes. Only claim success after this tool returns success=true.
+  mode: queued
+  max: 10
+  fields:
+    entity_id:
+      name: Climate entity
+      description: Exact climate entity ID or exact device name, such as Office Aircon. Use hvac_available_modes
+        if unsure. Ambiguous names are rejected.
+      selector:
+        text: {}
+      required: true
+    hvac_mode:
+      name: HVAC mode
+      required: true
+      description: Exact supported mode from hvac_available_modes. Map heating to heat, cooling to cool,
+        dehumidify to dry, fan only to fan_only. Automatic heating/cooling is heat_cool, not auto. Never
+        invent a mode.
+      selector:
+        select:
+          options:
+          - 'off'
+          - heat
+          - cool
+          - heat_cool
+          - auto
+          - dry
+          - fan_only
+  sequence:
+  - variables:
+      requested_target: '{{ entity_id | default('''') | string | lower | trim }}'
+      matching_entities: |-
+        {% set ns = namespace(ids=[]) %}
+        {% for s in states.climate %}
+        {% if requested_target in [s.entity_id | lower, s.name | lower, s.object_id | replace('_', ' ') | lower] %}
+        {% set ns.ids = ns.ids + [s.entity_id] %}
+        {% endif %}{% endfor %}{{ ns.ids }}
+  - if:
+    - condition: template
+      value_template: '{{ matching_entities | length != 1 }}'
+    then:
+    - variables:
+        failure_result:
+          success: false
+          error: Climate name is unknown or ambiguous. Ask for the exact unit name; do not guess. No mode
+            change was sent.
+    - stop: Climate name is unknown or ambiguous. Ask for the exact unit name; do not guess. No mode change
+        was sent.
+      response_variable: failure_result
+  - variables:
+      entity_id: '{{ matching_entities[0] }}'
+  - if:
+    - condition: template
+      value_template: '{{ entity_id is not defined or entity_id is not string or not entity_id.startswith(''climate.'')
+        or states(entity_id) in [''unknown'',''unavailable''] }}'
+    then:
+    - variables:
+        failure_result:
+          success: false
+          error: Climate unit is missing, invalid or unavailable. No mode change was sent.
+    - stop: Climate unit is missing, invalid or unavailable. No mode change was sent.
+      response_variable: failure_result
+  - if:
+    - condition: template
+      value_template: '{{ hvac_mode is not defined or hvac_mode not in (state_attr(entity_id, ''hvac_modes'')
+        or []) }}'
+    then:
+    - variables:
+        failure_result:
+          success: false
+          error: Requested HVAC mode is not supported by this unit. No mode change was sent. Use HVAC
+            available modes to report the supported choices.
+    - stop: Requested HVAC mode is not supported by this unit. No mode change was sent. Use HVAC available
+        modes to report the supported choices.
+      response_variable: failure_result
+  - action: climate.set_hvac_mode
+    target:
+      entity_id: '{{ entity_id }}'
+    data:
+      hvac_mode: '{{ hvac_mode }}'
+  - wait_template: '{{ is_state(entity_id, hvac_mode) }}'
+    timeout: 00:00:40
+    continue_on_timeout: true
+  - if:
+    - condition: template
+      value_template: '{{ not wait.completed or not is_state(entity_id, hvac_mode) }}'
+    then:
+    - variables:
+        failure_result:
+          success: false
+          error: HVAC mode change was not confirmed. Do not claim success.
+    - stop: HVAC mode change was not confirmed. Do not claim success.
+      response_variable: failure_result
+  - variables:
+      verified_result:
+        success: true
+        entity_id: '{{ entity_id }}'
+        name: '{{ state_attr(entity_id, ''friendly_name'') }}'
+        hvac_mode: '{{ states(entity_id) }}'
+        hvac_action: '{{ state_attr(entity_id, ''hvac_action'') }}'
+        target_temperature: '{{ state_attr(entity_id, ''temperature'') }}'
+        message: Requested HVAC mode is confirmed by Home Assistant. Target temperature was not changed
+          by this tool.
+  - stop: HVAC mode verified
+    response_variable: verified_result
